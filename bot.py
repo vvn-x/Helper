@@ -36,7 +36,7 @@ def _clean_id(raw: str):
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GUILD_ID = _clean_id(os.getenv("GUILD_ID"))
 TICKET_CATEGORY_ID = _clean_id(os.getenv("TICKET_CATEGORY_ID"))
-STAFF_ROLE_ID = _clean_id(os.getenv("STAFF_ROLE_ID")) or 1535668575585566871
+STAFF_ROLE_ID = _clean_id(os.getenv("STAFF_ROLE_ID")) or 1552620926917419068
 SPECIAL_ADMIN_ID = _clean_id(os.getenv("SPECIAL_ADMIN_ID")) or 920981254554406952
 LOG_CHANNEL_ID = _clean_id(os.getenv("LOG_CHANNEL_ID")) or 1281894208550076477
 PANEL_IMAGE_URL = os.getenv("PANEL_IMAGE_URL", "")
