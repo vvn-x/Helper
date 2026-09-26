@@ -9,8 +9,6 @@ import io
 import logging
 import asyncio
 import datetime
-import html
-import sqlite3
 from typing import Optional
 import aiohttp
 import discord
@@ -38,7 +36,7 @@ def _clean_id(raw: str):
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GUILD_ID = _clean_id(os.getenv("GUILD_ID"))
 TICKET_CATEGORY_ID = _clean_id(os.getenv("TICKET_CATEGORY_ID"))
-STAFF_ROLE_ID = _clean_id(os.getenv("STAFF_ROLE_ID")) or 1535668575585566871
+STAFF_ROLE_ID = _clean_id(os.getenv("STAFF_ROLE_ID")) or 1552620926917419068
 SPECIAL_ADMIN_ID = _clean_id(os.getenv("SPECIAL_ADMIN_ID")) or 920981254554406952
 LOG_CHANNEL_ID = _clean_id(os.getenv("LOG_CHANNEL_ID")) or 1281894208550076477
 PANEL_IMAGE_URL = os.getenv("PANEL_IMAGE_URL", "")
@@ -74,32 +72,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("melaad_tickets")
-
-# حظر فتح التذاكر مؤقتاً، محفوظ في SQLite ليبقى بعد إعادة التشغيل.
-TICKET_BAN_DB = os.getenv("TICKET_BAN_DB", "ticket_bans.sqlite3")
-
-def init_ticket_ban_db():
-    with sqlite3.connect(TICKET_BAN_DB) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS ticket_bans (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, expires_at TEXT, reason TEXT, PRIMARY KEY (guild_id, user_id))")
-
-def get_ticket_ban(guild_id: int, user_id: int):
-    with sqlite3.connect(TICKET_BAN_DB) as conn:
-        row = conn.execute("SELECT expires_at FROM ticket_bans WHERE guild_id=? AND user_id=?", (guild_id, user_id)).fetchone()
-        if not row:
-            return None
-        if row[0] is None:
-            return "permanent"
-        expires = datetime.datetime.fromisoformat(row[0])
-        if expires <= datetime.datetime.now(datetime.timezone.utc):
-            conn.execute("DELETE FROM ticket_bans WHERE guild_id=? AND user_id=?", (guild_id, user_id))
-            return None
-        return expires
-
-def set_ticket_ban(guild_id: int, user_id: int, hours: Optional[int], reason: str):
-    expires = None if hours is None else (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=hours)).isoformat()
-    with sqlite3.connect(TICKET_BAN_DB) as conn:
-        conn.execute("INSERT OR REPLACE INTO ticket_bans (guild_id,user_id,expires_at,reason) VALUES (?,?,?,?)", (guild_id,user_id,expires,reason))
-
 # نخفت شوية ضجيج مكتبة discord الداخلية ونبقي فقط التحذيرات والاخطاء
 logging.getLogger("discord").setLevel(logging.WARNING)
 
@@ -157,13 +129,12 @@ async def build_transcript_html(channel: discord.TextChannel) -> str:
     async for msg in channel.history(limit=None, oldest_first=True):
         messages.append(msg)
 
-    safe_channel_name = html.escape(channel.name)
     html_content = f"""
     <!DOCTYPE html>
     <html lang="ar" dir="rtl">
     <head>
         <meta charset="UTF-8">
-        <title>سجل تذكرة - {safe_channel_name}</title>
+        <title>سجل تذكرة - {channel.name}</title>
         <style>
             body {{ font-family: Arial, sans-serif; background-color: #36393f; color: #dcddde; padding: 20px; }}
             .header {{ border-bottom: 2px solid #000; padding-bottom: 10px; margin-bottom: 20px; }}
@@ -176,23 +147,21 @@ async def build_transcript_html(channel: discord.TextChannel) -> str:
     </head>
     <body>
         <div class="header">
-            <h2>سجل المحادثة للتذكرة: {safe_channel_name}</h2>
+            <h2>سجل المحادثة للتذكرة: {channel.name}</h2>
             <p>تاريخ الارشفة: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</p>
         </div>
     """
 
     for msg in messages:
         time_str = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        content = html.escape(discord.utils.escape_mentions(msg.content)) if msg.content else ""
-        author_name = html.escape(str(msg.author.display_name))
-        author_tag = html.escape(str(msg.author))
+        content = discord.utils.escape_mentions(msg.content) if msg.content else ""
         attachments_html = ""
         for att in msg.attachments:
-            attachments_html += f'<div class="attachment"><a href="{att.url}" target="_blank" rel="noopener noreferrer">مرفق: {html.escape(att.filename)}</a></div>'
+            attachments_html += f'<div class="attachment"><a href="{att.url}" target="_blank">مرفق: {att.filename}</a></div>'
 
         html_content += f"""
         <div class="message">
-            <span class="author">{author_name} ({author_tag})</span>
+            <span class="author">{msg.author.display_name} ({msg.author})</span>
             <span class="time">{time_str}</span>
             <div class="content">{content}</div>
             {attachments_html}
@@ -221,7 +190,7 @@ async def upload_transcript_preview_link(channel_name: str, html_content: str) -
     filename = f"transcript-{channel_name}.html"
     payload = {
         "description": f"سجل محادثة تذكرة - {channel_name}",
-        "public": False,
+        "public": True,
         "files": {
             filename: {"content": html_content}
         },
@@ -251,6 +220,49 @@ async def upload_transcript_preview_link(channel_name: str, html_content: str) -
         return None
 
 
+async def auto_delete_ticket_task(channel_id: int, guild_id: int, owner_id: int):
+    """
+    تنتظر هذه الدالة مدة ساعتين ثم تتحقق مما اذا كان صاحب التذكرة نفسه
+    قد ارسل اي رسالة داخل القناة، بغض النظر عن ردود فريق الدعم.
+    في حال عدم وجود اي رد من صاحب التذكرة يتم حذف القناة دون اي اشعار.
+    """
+    await asyncio.sleep(7200)  # الانتظار ساعتين (7200 ثانية)
+
+    try:
+        current_channel = bot.get_channel(channel_id)
+        if not current_channel:
+            logger.info("تخطي الحذف التلقائي للقناة %s لانها غير موجودة اصلا", channel_id)
+            return
+
+        owner_replied = False
+        async for msg in current_channel.history(limit=None, oldest_first=True):
+            if msg.author.id == owner_id:
+                owner_replied = True
+                break
+
+        if not owner_replied:
+            logger.info("حذف تلقائي للتذكرة %s بسبب عدم رد صاحبها خلال ساعتين", current_channel.name)
+            await current_channel.delete(reason="حذف تلقائي - لم يرد صاحب التذكرة خلال ساعتين")
+
+            guild = bot.get_guild(guild_id)
+            if guild:
+                embed = discord.Embed(
+                    title="حذف تلقائي لتذكرة",
+                    description="تم حذف هذه التذكرة تلقائيا لعدم رد صاحبها خلال ساعتين من فتحها",
+                    color=discord.Color.orange(),
+                    timestamp=datetime.datetime.utcnow(),
+                )
+                embed.add_field(name="اسم التذكرة", value=current_channel.name, inline=True)
+                embed.add_field(name="صاحب التذكرة", value=f"<@{owner_id}>", inline=True)
+                await safe_log_send(guild, embed=embed)
+        else:
+            logger.info("لا حذف تلقائي للتذكرة %s لان صاحبها رد بالفعل", current_channel.name)
+    except discord.NotFound:
+        pass
+    except Exception:
+        logger.exception("خطا غير متوقع اثناء تنفيذ مهمة الحذف التلقائي للقناة %s", channel_id)
+
+
 def next_ticket_number(guild: discord.Guild) -> int:
     """
     يحسب رقم التذكرة التالي بالاعتماد على القنوات الموجودة فعليا
@@ -272,7 +284,7 @@ def find_open_ticket(guild: discord.Guild, user_id: int):
         if not isinstance(ch, discord.TextChannel):
             continue
         data = parse_topic(ch.topic)
-        if data.get("user") == str(user_id) and data.get("type") in {"inquiry", "complaint", "help", "special"}:
+        if data.get("user") == str(user_id):
             return ch
     return None
 
@@ -282,26 +294,23 @@ def find_open_ticket(guild: discord.Guild, user_id: int):
 # =========================================================
 
 class ConfirmDeleteView(discord.ui.View):
-    def __init__(self, requester_id: int, ticket_channel_id: int):
+    def __init__(self):
         super().__init__(timeout=60)
-        self.requester_id = requester_id
-        self.ticket_channel_id = ticket_channel_id
 
     @discord.ui.button(label="تاكيد الحذف", style=discord.ButtonStyle.danger, custom_id="confirm_delete_btn")
     async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        channel = interaction.guild.get_channel(self.ticket_channel_id) if interaction.guild else None
-        if channel is None or not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("قناة التذكرة لم تعد موجودة", ephemeral=True)
-            return
+        channel = interaction.channel
         data = parse_topic(channel.topic)
         ticket_type = data.get("type")
-        claimer_id = data.get("claimed")
-        allowed = interaction.user.guild_permissions.administrator or (claimer_id and str(interaction.user.id) == claimer_id)
+
         if ticket_type == "special":
-            allowed = interaction.user.guild_permissions.administrator or interaction.user.id == SPECIAL_ADMIN_ID
-        if not allowed:
-            await interaction.response.send_message("إغلاق التذكرة مسموح فقط لمستلمها أو للأدمنستريتر", ephemeral=True)
-            return
+            if interaction.user.id != SPECIAL_ADMIN_ID:
+                await interaction.response.send_message("لا يمكنك حذف هذه التذكرة", ephemeral=True)
+                return
+        else:
+            if not is_staff(interaction.user):
+                await interaction.response.send_message("لا تملك صلاحية حذف التذكرة", ephemeral=True)
+                return
 
         button.disabled = True
         await interaction.response.edit_message(content="جاري حفظ السجل وحذف التذكرة خلال خمس ثواني", view=None)
@@ -350,199 +359,66 @@ class ConfirmDeleteView(discord.ui.View):
 # ==================== ازرار / نوافذ الحذف والاستلام =========
 # =========================================================
 
-class RenameTicketModal(discord.ui.Modal, title="إعادة تسمية التذكرة"):
-    new_name = discord.ui.TextInput(
-        label="الاسم الجديد للتذكرة",
-        placeholder="اكتب الاسم الجديد بدون رموز أو مسافات",
-        max_length=90,
-        required=True,
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        channel = interaction.channel
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("هذا الخيار يعمل داخل قناة التذكرة فقط", ephemeral=True)
-            return
-        cleaned = "-".join(str(self.new_name).strip().split()).lower()
-        if not cleaned:
-            await interaction.response.send_message("اكتب اسمًا صالحًا للتذكرة", ephemeral=True)
-            return
-        try:
-            await channel.edit(name=cleaned[:100], reason=f"إعادة تسمية التذكرة بواسطة {interaction.user}")
-            await interaction.response.send_message(f"تم تغيير اسم التذكرة إلى {channel.mention}", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.response.send_message("البوت لا يملك صلاحية إدارة القنوات", ephemeral=True)
-
-
-class TicketMemberSelect(discord.ui.UserSelect):
-    def __init__(self, action: str):
-        self.action = action
-        placeholder = "اختر العضو المراد إضافته" if action == "add" else "اختر العضو المراد إزالته"
-        super().__init__(placeholder=placeholder, min_values=1, max_values=1, custom_id=f"ticket_member_{action}")
-
-    async def callback(self, interaction: discord.Interaction):
-        channel = interaction.channel
-        member = self.values[0]
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("هذا الخيار يعمل داخل قناة التذكرة فقط", ephemeral=True)
-            return
-        try:
-            if self.action == "add":
-                await channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
-                msg = f"تمت إضافة {member.mention} إلى التذكرة"
-            else:
-                await channel.set_permissions(member, overwrite=None)
-                msg = f"تمت إزالة {member.mention} من التذكرة"
-            await interaction.response.send_message(msg, ephemeral=True)
-        except discord.Forbidden:
-            await interaction.response.send_message("البوت لا يملك صلاحية تعديل صلاحيات القناة", ephemeral=True)
-
-
-class TicketMemberActionView(discord.ui.View):
-    def __init__(self, action: str):
-        super().__init__(timeout=120)
-        self.add_item(TicketMemberSelect(action))
-
-
-class TicketBanDurationSelect(discord.ui.Select):
-    def __init__(self, owner_id: int):
-        self.owner_id = owner_id
-        options = [
-            discord.SelectOption(label="ساعة واحدة", value="1"),
-            discord.SelectOption(label="6 ساعات", value="6"),
-            discord.SelectOption(label="24 ساعة", value="24"),
-            discord.SelectOption(label="3 أيام", value="72"),
-            discord.SelectOption(label="7 أيام", value="168"),
-            discord.SelectOption(label="دائم من فتح التذاكر", value="permanent"),
-        ]
-        super().__init__(placeholder="اختر مدة منع فتح التذاكر", options=options, min_values=1, max_values=1)
-
-    async def callback(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.manage_guild and not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("تحتاج إلى صلاحية إدارة السيرفر لاستخدام هذا الخيار", ephemeral=True)
-            return
-        value = self.values[0]
-        hours = None if value == "permanent" else int(value)
-        set_ticket_ban(interaction.guild.id, self.owner_id, hours, f"تم بواسطة {interaction.user}")
-        if hours is None:
-            msg = f"تم منع <@{self.owner_id}> من فتح التذاكر بشكل دائم."
-        else:
-            expiry = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=hours)
-            msg = f"تم منع <@{self.owner_id}> من فتح التذاكر لمدة {hours} ساعة. ينتهي الحظر <t:{int(expiry.timestamp())}:R>."
-        await interaction.response.edit_message(content=msg, view=None)
-
-class TicketBanDurationView(discord.ui.View):
-    def __init__(self, owner_id: int):
-        super().__init__(timeout=120)
-        self.add_item(TicketBanDurationSelect(owner_id))
-
-
-class TicketManagementSelect(discord.ui.Select):
-    def __init__(self):
-        options = [
-            discord.SelectOption(label="إعادة تسمية التذكرة", value="rename", description="تغيير اسم هذه التذكرة"),
-            discord.SelectOption(label="إضافة عضو", value="add_member", description="إضافة عضو إلى هذه التذكرة"),
-            discord.SelectOption(label="إزالة عضو", value="remove_member", description="إزالة عضو من هذه التذكرة"),
-            discord.SelectOption(label="استدعاء شخص", value="summon", description="إرسال تنبيه لصاحب التذكرة"),
-            discord.SelectOption(label="منع صاحب التذكرة من فتح التذاكر", value="ban_owner", description="اختيار مدة منع فتح التذاكر"),
-            discord.SelectOption(label="إغلاق التذكرة", value="close", description="حفظ السجل ثم إغلاق التذكرة"),
-        ]
-        super().__init__(placeholder="Choose an option", options=options, min_values=1, max_values=1,
-                         custom_id="ticket_management_select")
-
-    async def callback(self, interaction: discord.Interaction):
-        channel = interaction.channel
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("هذا الخيار يعمل داخل قناة التذكرة فقط", ephemeral=True)
-            return
-        data = parse_topic(channel.topic)
-        if data.get("type") not in {"inquiry", "complaint", "help", "special"}:
-            await interaction.response.send_message("هذه القناة ليست تذكرة معتمدة", ephemeral=True)
-            return
-        if not is_staff(interaction.user) and interaction.user.id != SPECIAL_ADMIN_ID:
-            await interaction.response.send_message("لا تملك صلاحية إدارة هذه التذكرة", ephemeral=True)
-            return
-
-        choice = self.values[0]
-        if choice == "rename":
-            await interaction.response.send_modal(RenameTicketModal())
-        elif choice == "add_member":
-            await interaction.response.send_message("اختر العضو الذي تريد إضافته:", view=TicketMemberActionView("add"), ephemeral=True)
-        elif choice == "remove_member":
-            await interaction.response.send_message("اختر العضو الذي تريد إزالته:", view=TicketMemberActionView("remove"), ephemeral=True)
-        elif choice == "summon":
-            owner_id = data.get("user")
-            if not owner_id:
-                await interaction.response.send_message("تعذر العثور على صاحب التذكرة", ephemeral=True)
-                return
-            await interaction.response.send_message(f"تم استدعاء صاحب التذكرة <@{owner_id}>", ephemeral=True)
-            await channel.send(f"<@{owner_id}>، أحد المسؤولين يطلب حضورك إلى التذكرة.", allowed_mentions=discord.AllowedMentions(users=True))
-        elif choice == "ban_owner":
-            owner_id = data.get("user")
-            if not owner_id:
-                await interaction.response.send_message("تعذر العثور على صاحب التذكرة", ephemeral=True)
-                return
-            if not (interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.administrator):
-                await interaction.response.send_message("تحتاج إلى صلاحية إدارة السيرفر لاستخدام هذا الخيار", ephemeral=True)
-                return
-            await interaction.response.send_message(
-                f"اختر مدة منع صاحب التذكرة <@{owner_id}> من فتح تذاكر جديدة:",
-                view=TicketBanDurationView(int(owner_id)), ephemeral=True
-            )
-        elif choice == "close":
-            claimer_id = data.get("claimed")
-            allowed = interaction.user.guild_permissions.administrator or (claimer_id and str(interaction.user.id) == claimer_id)
-            if data.get("type") == "special":
-                allowed = interaction.user.guild_permissions.administrator or interaction.user.id == SPECIAL_ADMIN_ID
-            if not allowed:
-                await interaction.response.send_message("إغلاق التذكرة مسموح فقط لمستلمها أو للأدمنستريتر", ephemeral=True)
-                return
-            await interaction.response.send_message(
-                content="هل أنت متأكد من أنك تريد إغلاق هذه التذكرة؟",
-                view=ConfirmDeleteView(interaction.user.id, channel.id), ephemeral=True
-            )
-
-
 class TicketActionsView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(TicketManagementSelect())
 
-    @discord.ui.button(label="استلام التذكرة", style=discord.ButtonStyle.secondary, custom_id="ticket_claim")
+    @discord.ui.button(style=discord.ButtonStyle.secondary, emoji=DELETE_EMOJI, custom_id="ticket_delete")
+    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.channel
+        data = parse_topic(channel.topic)
+        ticket_type = data.get("type")
+
+        if ticket_type == "special":
+            if interaction.user.id != SPECIAL_ADMIN_ID:
+                await interaction.response.send_message("لا يمكنك حذف هذه التذكرة", ephemeral=True)
+                return
+        else:
+            if not is_staff(interaction.user):
+                await interaction.response.send_message("لا تملك صلاحية حذف التذكرة", ephemeral=True)
+                return
+
+        await interaction.response.send_message(
+            content="هل انت متاكد من انك تريد حذف هذه التذكرة؟",
+            view=ConfirmDeleteView(),
+            ephemeral=True
+        )
+
+    @discord.ui.button(style=discord.ButtonStyle.secondary, emoji=CLAIM_EMOJI, custom_id="ticket_claim")
     async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         channel = interaction.channel
         guild = interaction.guild
-        if not isinstance(channel, discord.TextChannel) or guild is None:
-            await interaction.response.send_message("هذا الخيار يعمل داخل التذكرة فقط", ephemeral=True)
-            return
         data = parse_topic(channel.topic)
         ticket_type = data.get("type")
+
         if ticket_type == "special":
             if interaction.user.id != SPECIAL_ADMIN_ID:
                 await interaction.response.send_message("لا يمكنك استلام هذه التذكرة", ephemeral=True)
                 return
-        elif not is_staff(interaction.user):
-            await interaction.response.send_message("لا تملك صلاحية استلام التذكرة", ephemeral=True)
-            return
+        else:
+            if not is_staff(interaction.user):
+                await interaction.response.send_message("لا تملك صلاحية استلام التذكرة", ephemeral=True)
+                return
 
+        # نؤكد استلام التفاعل فورا قبل اي طلب بطيء لتفادي خطا عدم الاستجابة
         await interaction.response.defer()
+
         try:
             staff_role = guild.get_role(STAFF_ROLE_ID)
             if staff_role:
                 await channel.set_permissions(staff_role, view_channel=False)
+
             await channel.set_permissions(interaction.user, view_channel=True, send_messages=True, read_message_history=True)
         except discord.Forbidden:
-            await interaction.followup.send("لا يملك البوت الصلاحيات الكافية لتعديل صلاحيات هذه القناة", ephemeral=True)
+            logger.error("صلاحيات ناقصة عند محاولة استلام التذكرة %s من قبل %s", channel.name, interaction.user)
+            await interaction.followup.send(
+                "لا يملك البوت الصلاحيات الكافية لتعديل صلاحيات هذه القناة، تاكد من صلاحية Manage Channels وترتيب رتبة البوت",
+                ephemeral=True
+            )
             return
-
-        topic_data = parse_topic(channel.topic)
-        topic_data["claimed"] = str(interaction.user.id)
-        new_topic = "|".join(f"{key}:{val}" for key, val in topic_data.items())
-        try:
-            await channel.edit(topic=new_topic, reason=f"تم استلام التذكرة بواسطة {interaction.user}")
         except Exception:
-            logger.exception("تعذر حفظ هوية مستلم التذكرة %s", channel.name)
-            await interaction.followup.send("تم تعديل الصلاحيات لكن تعذر حفظ هوية المستلم", ephemeral=True)
+            logger.exception("خطا غير متوقع اثناء استلام التذكرة %s", channel.name)
+            await interaction.followup.send("حدث خطا غير متوقع اثناء استلام التذكرة", ephemeral=True)
             return
 
         button.disabled = True
@@ -551,10 +427,14 @@ class TicketActionsView(discord.ui.View):
         except Exception:
             logger.exception("فشل تعديل زر الاستلام بعد استلام التذكرة %s", channel.name)
 
-        await interaction.followup.send(f"تم استلام التذكرة بواسطة {interaction.user.display_name}")
+        await interaction.followup.send(f"تم استلام هذه التذكرة من قبل {interaction.user.mention}")
         logger.info("تم استلام التذكرة %s من قبل %s", channel.name, interaction.user)
 
-        embed = discord.Embed(title="تم استلام التذكرة وقفلها", color=discord.Color.blue(), timestamp=datetime.datetime.utcnow())
+        embed = discord.Embed(
+            title="تم استلام التذكرة وقفلها",
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.utcnow()
+        )
         embed.add_field(name="القناة", value=channel.mention, inline=True)
         embed.add_field(name="المستلم", value=interaction.user.mention, inline=True)
         embed.add_field(name="رابط التذكرة", value=f"[اضغط هنا]({ticket_jump_url(channel)})", inline=False)
@@ -585,14 +465,6 @@ class TicketTypeSelect(discord.ui.Select):
         # نؤكد استلام التفاعل فورا لان انشاء القناة قد ياخذ وقتا او يفشل
         await interaction.response.defer(ephemeral=True)
 
-        ticket_ban = get_ticket_ban(guild.id, user.id)
-        if ticket_ban == "permanent":
-            await interaction.edit_original_response(content="لا يمكنك فتح تذكرة جديدة؛ تم منعك من فتح التذاكر بشكل دائم.", view=None)
-            return
-        if ticket_ban:
-            await interaction.edit_original_response(content=f"لا يمكنك فتح تذكرة جديدة حالياً. ينتهي المنع <t:{int(ticket_ban.timestamp())}:R>.", view=None)
-            return
-
         existing_ticket = find_open_ticket(guild, user.id)
         if existing_ticket:
             await interaction.edit_original_response(
@@ -604,13 +476,6 @@ class TicketTypeSelect(discord.ui.Select):
         category = None
         if TICKET_CATEGORY_ID:
             category = guild.get_channel(TICKET_CATEGORY_ID)
-            if category is None or not isinstance(category, discord.CategoryChannel):
-                await interaction.edit_original_response(content="معرف تصنيف التذاكر غير صحيح أو التصنيف غير موجود", view=None)
-                return
-
-        if guild.me is None:
-            await interaction.edit_original_response(content="تعذر تحديد عضوية البوت داخل السيرفر؛ حاول لاحقًا", view=None)
-            return
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -663,18 +528,8 @@ class TicketTypeSelect(discord.ui.Select):
         staff_role = guild.get_role(STAFF_ROLE_ID)
         mention_line = f"{staff_role.mention if staff_role else 'فريق الدعم'} | {user.mention}"
 
-        ticket_type_ar = {
-            "inquiry": "استفسار",
-            "complaint": "شكوى",
-            "help": "مساعدة",
-            "special": "رتب خاصة",
-        }[value]
-
         welcome_embed = discord.Embed(
-            description=(
-                "اهلا وسهلا يرجى كتابة موضوع طلبك وسيتم الرد عليك من قبل المسؤولين"
-                f"\\n\\nنوع التذكرة : {ticket_type_ar}"
-            ),
+            description="اهلا وسهلا يرجى كتابة موضوع طلبك وسيتم الرد عليك من قبل المسؤولين",
             color=discord.Color.dark_theme(),
         )
         if PANEL_IMAGE_URL:
@@ -686,11 +541,9 @@ class TicketTypeSelect(discord.ui.Select):
             )
             await ticket_message.pin()
         except discord.HTTPException:
-            logger.exception("فشل إرسال أو تثبيت رسالة الترحيب داخل التذكرة %s", ticket_channel.name)
-            await safe_log_send(guild, content=f"تنبيه: تعذر إرسال/تثبيت رسالة الترحيب في {ticket_channel.mention}. يلزم تدخل إداري.")
+            logger.warning("لم يتم تثبيت رسالة الترحيب داخل التذكرة %s", ticket_channel.name)
         except Exception:
             logger.exception("فشل ارسال رسالة الترحيب داخل التذكرة %s", ticket_channel.name)
-            await safe_log_send(guild, content=f"تنبيه: تعذر تجهيز رسالة الترحيب في {ticket_channel.mention}. يلزم تدخل إداري.")
 
         embed = discord.Embed(
             title="تم فتح تذكرة جديدة",
@@ -698,7 +551,7 @@ class TicketTypeSelect(discord.ui.Select):
             timestamp=datetime.datetime.utcnow()
         )
         embed.add_field(name="صاحب التذكرة", value=user.mention, inline=True)
-        embed.add_field(name="النوع", value=ticket_type_ar, inline=True)
+        embed.add_field(name="النوع", value=value, inline=True)
         embed.add_field(name="القناة", value=ticket_channel.mention, inline=True)
         embed.add_field(name="رابط التذكرة", value=f"[اضغط هنا]({ticket_jump_url(ticket_channel)})", inline=False)
         await safe_log_send(guild, embed=embed)
@@ -707,6 +560,8 @@ class TicketTypeSelect(discord.ui.Select):
 
         await interaction.edit_original_response(content=f"تم فتح تذكرتك هنا {ticket_channel.mention}", view=None)
 
+        # البدء بمراقبة الحذف التلقائي بعد ساعتين من عدم رد صاحب التذكرة
+        asyncio.create_task(auto_delete_ticket_task(ticket_channel.id, guild.id, user.id))
 
 
 class TicketTypeView(discord.ui.View):
@@ -719,6 +574,13 @@ class TicketTypeView(discord.ui.View):
 # ===================== لوحة فتح التذكرة =====================
 # =========================================================
 
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(style=discord.ButtonStyle.secondary, emoji=TICKET_ICON_EMOJI, custom_id="open_ticket_panel")
+    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(view=TicketTypeView(), ephemeral=True)
 
 
 # =========================================================
@@ -728,12 +590,9 @@ class TicketTypeView(discord.ui.View):
 @bot.tree.command(name="panel", description="ارسال لوحة فتح التذاكر")
 @app_commands.checks.has_permissions(administrator=True)
 async def panel(interaction: discord.Interaction):
-    panel_embed = discord.Embed(color=discord.Color.dark_theme())
-    if PANEL_IMAGE_URL:
-        panel_embed.set_image(url=PANEL_IMAGE_URL)
+    content = PANEL_IMAGE_URL if PANEL_IMAGE_URL else ""
 
-    # تظهر قائمة "اختر طلبك" مباشرة تحت الصورة، دون زر وسيط.
-    await interaction.channel.send(embed=panel_embed, view=TicketTypeView())
+    await interaction.channel.send(content=content, view=TicketPanelView())
     await interaction.response.send_message("تم ارسال اللوحة", ephemeral=True)
     logger.info("تم ارسال لوحة فتح التذاكر بواسطة %s في القناة %s", interaction.user, interaction.channel)
 
@@ -752,7 +611,7 @@ async def memberadd(interaction: discord.Interaction, member: discord.Member):
     channel = interaction.channel
     data = parse_topic(channel.topic)
 
-    if data.get("type") not in {"inquiry", "complaint", "help", "special"} or not data.get("user"):
+    if "type" not in data:
         await interaction.response.send_message("هذا الامر يعمل فقط داخل قناة تذكرة", ephemeral=True)
         return
 
@@ -819,10 +678,13 @@ async def on_error(event_method, *args, **kwargs):
 # =========================================================
 
 @bot.event
-async def setup_hook():
-    init_ticket_ban_db()
+async def on_ready():
+    global ticket_counter
+
+    bot.add_view(TicketPanelView())
     bot.add_view(TicketTypeView())
     bot.add_view(TicketActionsView())
+
     if GUILD_ID:
         guild_obj = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild_obj)
@@ -830,12 +692,10 @@ async def setup_hook():
     else:
         await bot.tree.sync()
 
-
-@bot.event
-async def on_ready():
-    global ticket_counter
+    # اعادة ضبط عداد التذاكر بالاعتماد على القنوات الموجودة فعليا بكل السيرفرات
     for guild in bot.guilds:
         ticket_counter = max(ticket_counter, next_ticket_number(guild))
+
     logger.info("تم تسجيل الدخول كـ %s (معرف: %s)", bot.user, bot.user.id)
     logger.info("عدد السيرفرات المتصلة: %s | عداد التذاكر الحالي: %s", len(bot.guilds), ticket_counter)
 
